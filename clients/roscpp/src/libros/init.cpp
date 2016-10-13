@@ -49,6 +49,9 @@
 #include "ros/transport/transport_tcp.h"
 #include "ros/internal_timer_manager.h"
 #include "XmlRpcSocket.h"
+#ifdef LITMUS_RT
+#include "ros/rt_param.h"
+#endif
 
 #include "roscpp/GetLoggers.h"
 #include "roscpp/SetLoggerLevel.h"
@@ -63,6 +66,7 @@
 #include <signal.h>
 
 #include <cstdlib>
+
 
 namespace ros
 {
@@ -96,6 +100,7 @@ CallbackQueuePtr g_global_queue;
 ROSOutAppender* g_rosout_appender;
 static CallbackQueuePtr g_internal_callback_queue;
 
+
 static bool g_initialized = false;
 static bool g_started = false;
 static bool g_atexit_registered = false;
@@ -106,6 +111,15 @@ static bool g_shutdown_requested = false;
 static volatile bool g_shutting_down = false;
 static boost::recursive_mutex g_shutting_down_mutex;
 static boost::thread g_internal_queue_thread;
+#ifdef LITMUS_RT
+static bool g_realtime = false;
+static RtParamPtr g_rt_param;
+
+bool isRealtime()
+{
+  return g_realtime;
+}
+#endif
 
 bool isInitialized()
 {
@@ -267,6 +281,16 @@ CallbackQueuePtr getInternalCallbackQueue()
   return g_internal_callback_queue;
 }
 
+RtParamPtr getRtParam()
+{
+	if(!g_rt_param)
+	{
+		g_rt_param.reset(new RtParam);
+	}
+
+	return g_rt_param;
+}
+
 void basicSigintHandler(int sig)
 {
   (void)sig;
@@ -289,6 +313,43 @@ bool isStarted()
 {
   return g_started;
 }
+
+
+#ifdef LITMUS_RT
+bool checkRtArgs() {
+
+	std::string tmp_str;
+	int tmp_int;
+	RtParamPtr rt_param_ptr = getRtParam();
+	if (param::get(names::resolve("~rt"), tmp_str)) {
+		// node is launched with RT parameters, see if we can become a
+		// real-time process
+		if (tmp_str == "classic" || tmp_str == "reservation") {
+				rt_param_ptr->sched_type = tmp_str;
+				if (param::get(names::resolve("~scheduler"), tmp_str))
+					rt_param_ptr->scheduler = tmp_str;
+				else
+					goto ret_fault;
+
+				if (param::get(names::resolve("~partition"), tmp_int))
+					rt_param_ptr->partition = tmp_int;
+				if (param::get(names::resolve("~priority"), tmp_int))
+					rt_param_ptr->priority = tmp_int;
+				if (param::get(names::resolve("~period"), tmp_int))
+					rt_param_ptr->period = tmp_int;
+				if (param::get(names::resolve("~budget"), tmp_int))
+					rt_param_ptr->budget = tmp_int;
+				ROS_INFO("RT mode requested with %s scheduler",
+								 rt_param_ptr->scheduler.c_str());
+				return true;
+		}
+	}
+ret_fault:
+			rt_param_ptr.reset();
+			return false;
+}
+
+#endif
 
 void start()
 {
@@ -315,6 +376,26 @@ void start()
     {
     }
   }
+
+#ifdef LITMUS_RT
+	//checkRtArgs() allocates and initializes the per-node RT parameter object
+	g_realtime = checkRtArgs();
+	if (g_realtime) {
+		if (g_rt_param->sched_type == "classic") {
+			ROS_WARN("We do not support classic LITMUS plugins yet!");
+		}
+		else {
+			if (g_rt_param->period == -1 || g_rt_param->budget == -1) {
+				ROS_INFO("Period and budget are not provided, will try to locate the "
+								 "reservation with id %d", g_rt_param->partition);
+			}
+			else {
+				ROS_INFO("Period and budget are provided. Will try to create the budget "
+								 "in core %d", g_rt_param->partition);
+			}
+		}
+	}
+#endif
 
   char* env_ipv6 = NULL;
 #ifdef _MSC_VER
@@ -459,7 +540,6 @@ void init(const M_string& remappings, const std::string& name, uint32_t options)
     this_node::init(name, remappings, options);
     file_log::init(remappings);
     param::init(remappings);
-
     g_initialized = true;
   }
 }
@@ -601,6 +681,18 @@ void shutdown()
     XMLRPCManager::instance()->shutdown();
   }
 
+#ifdef LITMUS_RT
+	if (g_realtime) {
+		param::del(names::resolve("~rt"));
+		param::del(names::resolve("~scheduler"));
+		param::del(names::resolve("~partition"));
+		param::del(names::resolve("~period"));
+		param::del(names::resolve("~budget"));
+		param::del(names::resolve("~priority"));
+		g_rt_param.reset();
+		g_realtime = false;
+	}
+#endif
   WallTime end = WallTime::now();
 
   g_started = false;

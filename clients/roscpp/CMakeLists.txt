@@ -121,6 +121,7 @@ add_library(roscpp
   )
 
 add_dependencies(roscpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+add_definitions(-DLITMUS_RT)
 
 target_link_libraries(roscpp
   ${catkin_LIBRARIES}
