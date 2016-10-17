@@ -49,8 +49,10 @@
 #include "ros/transport/transport_tcp.h"
 #include "ros/internal_timer_manager.h"
 #include "XmlRpcSocket.h"
+
 #ifdef LITMUS_RT
 #include "ros/rt_param.h"
+#include "litmus.h"
 #endif
 
 #include "roscpp/GetLoggers.h"
@@ -314,13 +316,20 @@ bool isStarted()
   return g_started;
 }
 
+#define want_nonnegative_arg(arg, min) ({ \
+	if(arg < min)														\
+		goto ret_fault;												\
+})
 
 #ifdef LITMUS_RT
 bool checkRtArgs() {
 
 	std::string tmp_str;
 	int tmp_int;
+	double tmp_float;
+	bool tmp_bool;
 	RtParamPtr rt_param_ptr = getRtParam();
+	reservation_type_t res_type;
 	if (param::get(names::resolve("~rt"), tmp_str)) {
 		// node is launched with RT parameters, see if we can become a
 		// real-time process
@@ -330,25 +339,74 @@ bool checkRtArgs() {
 					rt_param_ptr->scheduler = tmp_str;
 				else
 					goto ret_fault;
+				res_type = static_cast<reservation_type_t>
+					(parse_reservation_type(rt_param_ptr->scheduler));
+				if (res_type < 0)
+					goto ret_fault;
+				rt_param_ptr->res_type = res_type;
 
-				if (param::get(names::resolve("~partition"), tmp_int))
+				if (param::get(names::resolve("~partition"), tmp_int)) {
+					want_nonnegative_arg(tmp_int, 0);
 					rt_param_ptr->partition = tmp_int;
-				if (param::get(names::resolve("~priority"), tmp_int))
-					rt_param_ptr->priority = tmp_int;
-				if (param::get(names::resolve("~period"), tmp_int))
-					rt_param_ptr->period = tmp_int;
-				if (param::get(names::resolve("~budget"), tmp_int))
-					rt_param_ptr->budget = tmp_int;
+				}
+				if (param::get(names::resolve("~priority"), tmp_int)) {
+					want_nonnegative_arg(tmp_int,0);
+					rt_param_ptr->priority = (unsigned int)tmp_int;
+				}
+				if (param::get(names::resolve("~period"), tmp_float)) {
+					want_nonnegative_arg(tmp_float,0);
+					rt_param_ptr->period = tmp_float;
+				}
+				if (param::get(names::resolve("~budget"), tmp_float)) {
+					want_nonnegative_arg(tmp_int,0);
+					rt_param_ptr->budget = tmp_float;
+				}
+				if (param::get(names::resolve("~deadline"), tmp_float)) {
+					want_nonnegative_arg(tmp_float,0);
+					rt_param_ptr->deadline = tmp_float;
+				}
+				if (param::get(names::resolve("~res_id"), tmp_int)) {
+					want_nonnegative_arg(tmp_int,0);
+					rt_param_ptr->res_id = tmp_int;
+				}
+				if (param::get(names::resolve("~create_new"), tmp_bool)) {
+					rt_param_ptr->create_new = tmp_bool;
+				}
 				ROS_INFO("RT mode requested with %s scheduler",
 								 rt_param_ptr->scheduler.c_str());
 				return true;
 		}
 	}
 ret_fault:
+			ROS_WARN("Parameters are incorrect\n%s", rt_param_ptr->to_str());
 			rt_param_ptr.reset();
 			return false;
 }
 
+int set_rt_param(RtParamPtr& rt_param) {
+	struct rt_task param;
+	int ret;
+	init_rt_task_param(&param);
+
+	if (rt_param->partition != -1) {
+		ret = be_migrate_to_domain(rt_param->partition);
+		if (ret < 0) {
+			ROS_WARN("be_migrate_to_domain() failed");
+			return -1;
+		}
+
+		if (rt_param->sched_type == "reservation")
+			param.cpu = rt_param->res_id;
+		else
+			param.cpu = domain_to_first_cpu(rt_param->partition);
+	}
+	param.exec_cost = rt_param->budget;
+	param.period = rt_param->period;
+	param.relative_deadline = rt_param->deadline;
+	param.priority = rt_param->priority;
+	param.budget_policy = NO_ENFORCEMENT;
+	return set_rt_task_param(gettid(), &param);
+}
 #endif
 
 void start()
@@ -378,6 +436,8 @@ void start()
   }
 
 #ifdef LITMUS_RT
+
+	int ret_val;
 	//checkRtArgs() allocates and initializes the per-node RT parameter object
 	g_realtime = checkRtArgs();
 	if (g_realtime) {
@@ -385,13 +445,83 @@ void start()
 			ROS_WARN("We do not support classic LITMUS plugins yet!");
 		}
 		else {
-			if (g_rt_param->period == -1 || g_rt_param->budget == -1) {
-				ROS_INFO("Period and budget are not provided, will try to locate the "
-								 "reservation with id %d", g_rt_param->partition);
+			if (!g_rt_param->create_new) {
+				ROS_INFO("create_new is not set, so we'll try to locate the "
+								 "reservation with res_id %d", g_rt_param->res_id);
 			}
 			else {
-				ROS_INFO("Period and budget are provided. Will try to create the budget "
-								 "in core %d", g_rt_param->partition);
+				ROS_INFO("Create_new is set. so we'll try to create the reservation "
+								 "with parameters\n%s", g_rt_param->to_str());
+				struct reservation_config config;
+				config.id = g_rt_param->res_id;
+				config.cpu = g_rt_param->partition;
+				config.priority = g_rt_param->priority;
+
+				switch (g_rt_param->res_type) {
+					case PERIODIC_POLLING:
+					case SPORADIC_POLLING:
+					case SOFT_POLLING:
+						config.polling_params.budget = ms2ns(g_rt_param->budget);
+						config.polling_params.period = ms2ns(g_rt_param->period);
+						config.polling_params.offset = ms2ns(g_rt_param->offset);
+						config.polling_params.relative_deadline
+							= ms2ns(g_rt_param->deadline);
+						break;
+					case SPORADIC_SERVER:
+						config.sporadic_server_params.budget = ms2ns(g_rt_param->budget);
+						config.sporadic_server_params.period = ms2ns(g_rt_param->period);
+						break;
+					case DEFERRABLE_SERVER:
+						config.deferrable_server_params.budget = ms2ns(g_rt_param->budget);
+						config.deferrable_server_params.period = ms2ns(g_rt_param->period);
+						config.deferrable_server_params.offset = ms2ns(g_rt_param->offset);
+						config.deferrable_server_params.relative_deadline
+							= ms2ns(g_rt_param->deadline);
+						break;
+					case CONSTANT_BANDWIDTH_SERVER:
+					case HARD_CONSTANT_BANDWIDTH_SERVER:
+					case CASH_CBS:
+					case FLEXIBLE_CBS:
+					case SLASH_SERVER:
+						config.cbs_params.budget = ms2ns(g_rt_param->budget);
+						config.cbs_params.period = ms2ns(g_rt_param->period);
+						break;
+					default:
+						break;
+			}
+
+			ret_val = reservation_create(g_rt_param->res_type, &config);
+			if (ret_val < 0) {
+				ROS_WARN("reservation_create() failed");
+				goto rt_fail;
+			}
+
+			ret_val = set_rt_param(g_rt_param);
+			if (ret_val != 0) {
+				ROS_WARN("set_rt_param() failed");
+				goto rt_fail;
+			}
+
+			ret_val = init_litmus();
+			if (ret_val != 0) {
+				ROS_WARN("init_litmus() failed");
+				goto rt_fail;
+			}
+
+			ret_val = task_mode(LITMUS_RT_TASK);
+			if (ret_val != 0) {
+				ROS_WARN("task_mode() failed");
+				goto rt_fail;
+			}
+
+			ROS_INFO("Became an RT task");
+			goto rt_success;
+
+rt_fail:
+			g_realtime = false;
+
+rt_success: ;
+
 			}
 		}
 	}
@@ -682,13 +812,21 @@ void shutdown()
   }
 
 #ifdef LITMUS_RT
+	int ret_val;
+	param::del(names::resolve("~rt"));
+	param::del(names::resolve("~scheduler"));
+	param::del(names::resolve("~partition"));
+	param::del(names::resolve("~period"));
+	param::del(names::resolve("~budget"));
+	param::del(names::resolve("~priority"));
+	param::del(names::resolve("~deadline"));
+	param::del(names::resolve("~res_id"));
+	param::del(names::resolve("~create_new"));
+	param::del(names::resolve("~offset"));
 	if (g_realtime) {
-		param::del(names::resolve("~rt"));
-		param::del(names::resolve("~scheduler"));
-		param::del(names::resolve("~partition"));
-		param::del(names::resolve("~period"));
-		param::del(names::resolve("~budget"));
-		param::del(names::resolve("~priority"));
+		ret_val = task_mode(BACKGROUND_TASK);
+		if (ret_val != 0)
+			ROS_WARN("Could not become regular task");
 		g_rt_param.reset();
 		g_realtime = false;
 	}

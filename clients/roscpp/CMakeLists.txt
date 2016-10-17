@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(roscpp)
 
+set(LIBLITMUS "/media/litmus/liblitmus")
+
 if(NOT WIN32)
   set_directory_properties(PROPERTIES COMPILE_OPTIONS "-std=c++11;-Wall;-Wextra")
 endif()
@@ -20,11 +22,11 @@ list(GET roscpp_VERSION_LIST 0 roscpp_VERSION_MAJOR)
 list(GET roscpp_VERSION_LIST 1 roscpp_VERSION_MINOR)
 list(GET roscpp_VERSION_LIST 2 roscpp_VERSION_PATCH)
 
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/ros/common.h.in ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros/common.h)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/include/ros/common.h.in ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros/common.h )
 
 find_package(Boost REQUIRED COMPONENTS signals filesystem system)
 
-include_directories(include ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros ${catkin_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS})
+include_directories(include ${CATKIN_DEVEL_PREFIX}/${CATKIN_GLOBAL_INCLUDE_DESTINATION}/ros ${catkin_INCLUDE_DIRS} ${Boost_INCLUDE_DIRS} ${LIBLITMUS}/include ${LIBLITMUS}/arch/x86/include ${LIBLITMUS}/arch/x86/include/uapi ${LIBLITMUS}/arch/x86/include/generated/uapi)
 
 add_message_files(
   DIRECTORY msg
@@ -69,8 +71,13 @@ CHECK_FUNCTION_EXISTS(trunc HAVE_TRUNC)
 # Output test results to config.h
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/libros/config.h.in ${CMAKE_CURRENT_BINARY_DIR}/config.h)
 include_directories(${CMAKE_CURRENT_BINARY_DIR})
+link_directories(${LIBLITMUS})
 
-add_library(roscpp 
+add_library(litmus STATIC IMPORTED)
+set_target_properties(litmus PROPERTIES
+  IMPORTED_LOCATION ${LIBLITMUS}/liblitmus.a)
+
+add_library(roscpp
   src/libros/master.cpp
   src/libros/network.cpp
   src/libros/subscriber.cpp
@@ -123,10 +130,13 @@ add_library(roscpp
 add_dependencies(roscpp ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 add_definitions(-DLITMUS_RT)
 
+
 target_link_libraries(roscpp
   ${catkin_LIBRARIES}
   ${Boost_LIBRARIES}
+  litmus
   )
+
 
 #explicitly install library and includes
 install(TARGETS roscpp
